@@ -1,0 +1,1272 @@
+"""
+DRE Gerencial Automatizado — Conector Nibo + Streamlit
+=======================================================
+
+Estrutura: Grupo (linha da DRE) > Subgrupo (opcional) > Categoria real do
+Nibo. Cada linha soma as categorias/subgrupos listados nela; os expansores
+abaixo da tabela mostram a composição detalhada, e toda tabela tem botão
+de exportar para Excel.
+
+Segurança: o token NUNCA fica no código. Ele é lido de st.secrets, que no
+Streamlit Cloud é configurado em Settings > Secrets (nunca vai pro GitHub).
+"""
+
+import io
+import json
+import os
+import re
+import streamlit as st
+import pandas as pd
+import requests
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+
+# =========================================================================
+# 1. ESTRUTURA DA DRE — Grupo/Subgrupo/Categoria (plano de contas real da
+#    GC - Marketing & Gestão Estratégica, exportado do Nibo)
+# =========================================================================
+#
+# Cada linha da DRE_STRUCTURE tem "sinal" (+1 entrada / -1 saída) e OU:
+#   - "categorias": lista simples de categorias do Nibo, OU
+#   - "subgrupos": dict {nome_subgrupo: [categorias...]} quando a linha tem
+#     mais de um nível de composição (ex.: Custo Fixo)
+#
+# Mudanças estruturais desta versão (confirmadas com o usuário):
+#   - "Custo Fixo" passa a ser um grupo único com 2 subgrupos (Despesas
+#     Administrativas + Folha/CMO), substituindo a separação anterior
+#     entre CSP e Despesas Operacionais. Por isso não há mais uma linha
+#     "Lucro Bruto" distinta — vai direto de Receita Líquida para Lucro
+#     Operacional.
+#   - "Financeira - tarifas bancárias" saiu de Tributos e entrou no novo
+#     grupo "Despesas Financeiras".
+#   - "Despesas administrativas - pró-labore" agora está incluída no
+#     subgrupo administrativo do Custo Fixo.
+
+DRE_STRUCTURE = {
+    "Receita Bruta": {
+        "sinal": 1,
+        "categorias": [
+            "Receita com vendas - Boleto",
+            "Receita com vendas - cartão de crédito",
+            "Financeira - receita financeira",
+            "Receita com vendas - pix",
+        ],
+    },
+    "Tributos": {  # redutor de receita / impostos e custos sobre venda
+        "sinal": -1,
+        "categorias": [
+            "Tributos - simples nacional",
+            "Custo com cobrança - boleto",
+            "Custo meio de emissão NF",
+            "Custo meio de pagamento - máquina crédito",
+            "Custo meio de pagamento - máquina crédito à vista",
+            "Custo meio de pagamento - máquina débito",
+            "Custo meio de pagamento - máquina pix",
+        ],
+    },
+    "Custo Fixo": {
+        "sinal": -1,
+        "subgrupos": {
+            "Despesa Operacional Administrativa": [
+                "Custos operacionais - a identificar",
+                "Despesas Administrativas - Cartão de Crédito",
+                "Despesas administrativas - certificado digital",
+                "Despesas administrativas - Confraternização Equipe",
+                "Despesas administrativas - contabilidade",
+                "Despesas administrativas - copa e cozinha",
+                "Despesas administrativas - escritório de advocacia",
+                "Despesas administrativas - eventos",
+                "Despesas administrativas - farmáxia",
+                "Despesas administrativas - Gráfica",
+                "Despesas administrativas - informática",
+                "Despesas administrativas - jurídico",
+                "Despesas administrativas - licenças e software",
+                "Despesas administrativas - material de escritório",
+                "Despesas administrativas - Medicina do Trabalho",
+                "Despesas administrativas - Patrocinios",
+                "Despesas administrativas - pró-labore",
+                "Despesas administrativas - serviço de limpeza",
+                "Despesas administrativas - serviço de terceiros",
+                "Despesas administrativas - telefonia e internet",
+                "Despesas administrativas - transporte urbano",
+                "Despesas administrativas - uniforme",
+                "Despesas administrativas - viagem",
+                "Despesas com instalação - água e esgoto",
+                "Despesas com instalação - aluguel",
+                "Despesas com instalação - energia elétrica",
+                "Despesas com instalação - iptu",
+                "Despesas com instalação - manutenção e conservação",
+                "Despesas com instalação - segurança e monitorament",
+            ],
+            "Despesas com Folha - CMO": [
+                "Folha - adiantamento de salários",
+                "Folha - cursos e treinamentos",
+                "Folha - fgts",
+                "Folha - inss",
+                "Folha - plano de saúde",
+                "Folha - rescisões",
+                "Folha - salários",
+                "Folha - vale alimentação",
+                "Folha - vale transporte",
+            ],
+        },
+    },
+    "Investimentos": {  # vem após o Lucro Operacional
+        "sinal": -1,
+        "categorias": [
+            "Investimento - Participação em Eventos",
+            "Investimento em Sistema Próprio",
+            "Máquinas e equipamentos",
+            "Marketing e publicidade - facebook ads",
+            "Marketing e publicidade - google ads",
+            "Móveis, utensílios e instalações",
+            "Compra de ativo fixo",
+        ],
+    },
+    "Despesas Financeiras": {
+        "sinal": -1,
+        "categorias": [
+            "Taxas e contribuições",
+            "Tributos - IOF",
+            "Financeira - despesas financeiras",
+            "Financeira - estornos",
+            "Financeira - juros fornecedores",
+            "Financeira - negociação de divida",
+            "Financeira - tarifas bancárias",
+        ],
+    },
+    "Atividade de Financiamento": {  # espelha o relatório nativo do Nibo
+        "sinal": -1,
+        "categorias": [
+            "Retirada de capital",
+            "Distribuição de lucros",
+            "Juros sobre empréstimo bnds",
+            "Pagamento empréstimo bnds",
+            "Pagamento de empréstimos a terceiros",
+            "Pagamento de empréstimo de sócios",
+            "Pagamento de empréstimos bancários",
+            "Juros sobre empréstimos bancários",
+            "Multas sobre empréstimos bancários",
+        ],
+    },
+}
+
+# Ordem de exibição da DRE, incluindo as linhas calculadas (subtotais)
+DRE_LINES_ORDER = [
+    ("Receita Bruta", "detalhe"),
+    ("Tributos", "detalhe"),
+    ("Receita Líquida", "subtotal"),
+    ("Custo Fixo", "detalhe"),
+    ("Lucro Operacional", "subtotal"),
+    ("Investimentos", "detalhe"),
+    ("Despesas Financeiras", "detalhe"),
+    ("Atividade de Financiamento", "detalhe"),
+    ("Não Classificado", "detalhe"),
+    ("Geração de Caixa Realizada", "subtotal"),
+]
+
+NIBO_BASE_URL = "https://api.nibo.com.br/empresas/v1"
+
+# Paleta oficial da marca Breakr (Manual de Marca, nov/2024) — usada só nos
+# gráficos, conforme solicitado.
+BREAKR_AMARELO = "#FF9406"   # Amarelo Fagulha
+BREAKR_VERMELHO = "#CA3F17"  # Vermelho Brasa
+BREAKR_CINZA = "#F3F4F7"     # Cinza Vapor
+BREAKR_PRETO = "#0F0D05"     # Preto Fumaça
+
+BREAKR_LOGO_B64 = "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"  # logo oficial, fundo removido
+
+
+def _norm(texto: str) -> str:
+    """Normaliza texto para comparação: remove espaços não separáveis (nbsp),
+    espaços duplicados e diferenças de maiúscula/minúscula."""
+    if texto is None:
+        return ""
+    texto = texto.replace("\xa0", " ")
+    texto = re.sub(r"\s+", " ", texto).strip()
+    return texto.lower()
+
+
+# Mapas invertidos: categoria normalizada -> (linha da DRE, subgrupo)
+_CATEGORIA_PARA_LINHA = {}
+_CATEGORIA_PARA_SUBGRUPO = {}
+for _linha, _info in DRE_STRUCTURE.items():
+    if "subgrupos" in _info:
+        for _sub, _cats in _info["subgrupos"].items():
+            for _cat in _cats:
+                _CATEGORIA_PARA_LINHA[_norm(_cat)] = _linha
+                _CATEGORIA_PARA_SUBGRUPO[_norm(_cat)] = _sub
+    else:
+        for _cat in _info["categorias"]:
+            _CATEGORIA_PARA_LINHA[_norm(_cat)] = _linha
+            _CATEGORIA_PARA_SUBGRUPO[_norm(_cat)] = _linha  # sem subgrupo real: usa o próprio nome da linha
+
+
+def classify_dre_line(categoria: str):
+    return _CATEGORIA_PARA_LINHA.get(_norm(categoria))
+
+
+def classify_subgrupo(categoria: str):
+    return _CATEGORIA_PARA_SUBGRUPO.get(_norm(categoria))
+
+
+# =========================================================================
+# 2. CONEXÃO COM A API DO NIBO
+# =========================================================================
+
+def get_credentials():
+    """Lê token e organization_id de st.secrets, com mensagens claras de erro."""
+    try:
+        token = st.secrets["NIBO_API_TOKEN"]
+    except (KeyError, FileNotFoundError):
+        st.error(
+            "❌ Token do Nibo não encontrado em st.secrets. "
+            "Configure `NIBO_API_TOKEN` em Settings > Secrets no Streamlit Cloud "
+            "(ou em `.streamlit/secrets.toml` localmente)."
+        )
+        st.stop()
+    org_id = st.secrets.get("NIBO_ORGANIZATION_ID", None)
+    return token, org_id
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_schedules(token: str, org_id: str, date_from: str, date_to: str) -> pd.DataFrame:
+    """
+    Busca lançamentos (contas a pagar/receber) do Nibo entre duas datas,
+    paginando via $top/$skip (padrão OData usado pela API do Nibo).
+    """
+    url = f"{NIBO_BASE_URL}/schedules"
+    headers = {"apitoken": token}
+    if org_id:
+        headers["organization_id"] = org_id
+
+    all_items = []
+    top = 500
+    skip = 0
+
+    while True:
+        params = {
+            "$top": top,
+            "$skip": skip,
+            "$filter": f"dueDate ge {date_from} and dueDate le {date_to}",
+            "$orderby": "dueDate asc",
+        }
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+        except requests.exceptions.RequestException as e:
+            st.error(f"❌ Falha de conexão com a API do Nibo: {e}")
+            st.stop()
+
+        if resp.status_code == 401:
+            st.error("❌ Token do Nibo inválido ou expirado (401 Unauthorized).")
+            st.stop()
+        if resp.status_code != 200:
+            st.error(f"❌ Erro na API do Nibo (HTTP {resp.status_code}): {resp.text[:300]}")
+            st.stop()
+
+        payload = resp.json()
+        items = payload.get("items", payload if isinstance(payload, list) else [])
+        if not items:
+            break
+
+        all_items.extend(items)
+        if len(items) < top:
+            break
+        skip += top
+
+    if not all_items:
+        return pd.DataFrame()
+
+    # --- normalização dos campos ---
+    # Calculamos a FRAÇÃO efetivamente paga/recebida de cada lançamento
+    # (value vs paidValue), não um booleano isPaid puro — isso captura
+    # pagamentos parciais corretamente.
+    rows = []
+    for it in all_items:
+        categories = it.get("categories") or [{
+            "categoryName": (it.get("category") or {}).get("name", "Não categorizado"),
+            "value": it.get("value", 0),
+        }]
+        data_competencia = it.get("accrualDate") or it.get("dueDate") or it.get("scheduleDate")
+        # Regime de Caixa: usa Vencimento (dueDate). Só funciona corretamente
+        # se, ao dar baixa em cada conta no Nibo, o Vencimento for ajustado
+        # para bater com a data real do pagamento (prática adotada pelo
+        # usuário de jan/2026 em diante).
+        data_pagamento = it.get("dueDate") or data_competencia
+        if not data_competencia:
+            continue
+
+        valor_categorias = [abs(float(cat.get("value", 0) or 0)) for cat in categories]
+        soma_categorias = sum(valor_categorias)
+        valor_schedule = abs(float(it.get("value", 0) or 0))
+        denom = soma_categorias if soma_categorias > 0 else valor_schedule
+
+        paid_value = it.get("paidValue")
+        if paid_value is None:
+            paid_value = valor_schedule if it.get("isPaid") else 0.0
+        paid_value = abs(float(paid_value or 0))
+
+        if denom > 0:
+            fracao_paga = min(paid_value / denom, 1.0)
+        else:
+            fracao_paga = 1.0 if it.get("isPaid") else 0.0
+
+        if fracao_paga <= 0:
+            continue
+
+        if soma_categorias > 0:
+            # Caso normal: cada categoria tem seu próprio valor de rateio.
+            for cat, valor_cat_base in zip(categories, valor_categorias):
+                nome_cat = cat.get("categoryName") or cat.get("name") or "Não categorizado"
+                valor_cat = valor_cat_base * fracao_paga
+                if valor_cat == 0:
+                    continue
+                rows.append({
+                    "data_competencia": data_competencia,
+                    "data_pagamento": data_pagamento,
+                    "categoria": nome_cat,
+                    "valor": valor_cat,
+                    "tipo_cat": cat.get("type", "out"),
+                })
+        else:
+            # Lançamento sem valor discriminado por categoria (comum em
+            # entradas manuais já criadas como pagas) — usa o valor
+            # efetivamente pago, dividido entre as categorias existentes,
+            # em vez de descartar o lançamento inteiro.
+            valor_realizado = paid_value if paid_value > 0 else valor_schedule * fracao_paga
+            if valor_realizado > 0 and categories:
+                valor_por_cat = valor_realizado / len(categories)
+                for cat in categories:
+                    nome_cat = cat.get("categoryName") or cat.get("name") or "Não categorizado"
+                    rows.append({
+                        "data_competencia": data_competencia,
+                        "data_pagamento": data_pagamento,
+                        "categoria": nome_cat,
+                        "valor": valor_por_cat,
+                        "tipo_cat": cat.get("type", "out"),
+                    })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    df["data_competencia"] = pd.to_datetime(df["data_competencia"], errors="coerce")
+    df["data_pagamento"] = pd.to_datetime(df["data_pagamento"], errors="coerce")
+    df = df.dropna(subset=["data_competencia"])
+    df["data_pagamento"] = df["data_pagamento"].fillna(df["data_competencia"])
+    return df
+
+
+# =========================================================================
+# 3. MONTAGEM DA DRE
+# =========================================================================
+
+def build_pivot_por_categoria(df: pd.DataFrame) -> pd.DataFrame:
+    """Pivot (linha_dre, subgrupo, categoria) x mês, com sinal já aplicado.
+    Categorias que não batem com nenhuma linha caem em "Não Classificado"
+    usando o tipo in/out do próprio lançamento para o sinal."""
+    if df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+    df["linha_dre"] = df["categoria"].apply(classify_dre_line)
+    df["subgrupo"] = df["categoria"].apply(classify_subgrupo)
+
+    def calc_valor_sinal(row):
+        linha = row["linha_dre"]
+        if linha is not None and linha in DRE_STRUCTURE:
+            return row["valor"] * DRE_STRUCTURE[linha]["sinal"]
+        return row["valor"] * (1 if row["tipo_cat"] == "in" else -1)
+
+    df["valor_sinal"] = df.apply(calc_valor_sinal, axis=1)
+    df["linha_dre"] = df["linha_dre"].fillna("Não Classificado")
+    df["subgrupo"] = df["subgrupo"].fillna("Não Classificado")
+
+    pivot = df.pivot_table(
+        index=["linha_dre", "subgrupo", "categoria"], columns="mes",
+        values="valor_sinal", aggfunc="sum", fill_value=0.0,
+    )
+    return pivot
+
+
+def build_dre(pivot_categoria: pd.DataFrame) -> pd.DataFrame:
+    """Soma o pivot por linha_dre e monta a DRE completa com subtotais."""
+    if pivot_categoria.empty:
+        return pd.DataFrame()
+
+    meses = sorted(pivot_categoria.columns)
+    por_linha = pivot_categoria.groupby(level="linha_dre").sum()
+    por_linha = por_linha.reindex(columns=meses, fill_value=0.0)
+
+    for linha in list(DRE_STRUCTURE) + ["Não Classificado"]:
+        if linha not in por_linha.index:
+            por_linha.loc[linha] = 0.0
+
+    dre = pd.DataFrame(index=[l for l, _ in DRE_LINES_ORDER], columns=meses, dtype=float)
+
+    for linha in DRE_STRUCTURE:
+        dre.loc[linha] = por_linha.loc[linha]
+    dre.loc["Não Classificado"] = por_linha.loc["Não Classificado"]
+
+    dre.loc["Receita Líquida"] = dre.loc["Receita Bruta"] + dre.loc["Tributos"]
+    dre.loc["Lucro Operacional"] = dre.loc["Receita Líquida"] + dre.loc["Custo Fixo"]
+    dre.loc["Geração de Caixa Realizada"] = (
+        dre.loc["Lucro Operacional"] + dre.loc["Investimentos"]
+        + dre.loc["Despesas Financeiras"] + dre.loc["Atividade de Financiamento"]
+        + dre.loc["Não Classificado"]
+    )
+
+    return dre
+
+
+# =========================================================================
+# 4. EXPORTAÇÃO PARA EXCEL
+# =========================================================================
+
+def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Dados") -> bytes:
+    """Converte um DataFrame (com o índice preservado) em bytes de .xlsx."""
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name=sheet_name[:31])
+    return buffer.getvalue()
+
+
+def botao_exportar(df: pd.DataFrame, nome_arquivo: str, label: str = "⬇️ Exportar para Excel"):
+    st.download_button(
+        label=label,
+        data=to_excel_bytes(df, sheet_name=nome_arquivo[:31]),
+        file_name=f"{nome_arquivo}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"download_{nome_arquivo}_{id(df)}",
+    )
+
+
+# =========================================================================
+# 5. METAS POR LINHA DA DRE (mês a mês)
+# =========================================================================
+# Persistidas em um arquivo JSON local. ⚠️ No Streamlit Cloud, o disco é
+# efêmero — se o app reiniciar (redeploy, hibernação por inatividade), esse
+# arquivo pode ser perdido. Por isso o botão "Exportar metas" serve como
+# backup: se isso acontecer, é só importar de novo.
+METAS_PATH = "metas.json"
+
+# Linhas em que bater a meta significa "atingir ou superar" o valor (metas
+# de receita/lucro/caixa). Nas demais linhas de custo, bater a meta
+# significa "não gastar mais do que o valor definido" (a meta é um teto).
+LINHAS_META_SUPERAR = {"Receita Bruta", "Receita Líquida", "Lucro Operacional", "Geração de Caixa Realizada"}
+
+
+def carregar_metas() -> dict:
+    if os.path.exists(METAS_PATH):
+        try:
+            with open(METAS_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def salvar_metas(metas: dict):
+    try:
+        with open(METAS_PATH, "w", encoding="utf-8") as f:
+            json.dump(metas, f, ensure_ascii=False, indent=2)
+        return True
+    except OSError:
+        return False
+
+
+def status_meta(linha: str, valor_real: float, meta: float):
+    """Retorna (emoji, texto) comparando o realizado com a meta."""
+    if meta is None or meta == 0:
+        return "", ""
+    if linha in LINHAS_META_SUPERAR:
+        pct = (valor_real / meta * 100) if meta else 0
+        if valor_real >= meta:
+            return "✅", f"{pct:.0f}% da meta"
+        elif pct >= 90:
+            return "⚠️", f"{pct:.0f}% da meta"
+        else:
+            return "❌", f"{pct:.0f}% da meta"
+    else:
+        # Linha de custo: meta é um teto de gasto (valor positivo).
+        gasto_real = abs(valor_real)
+        pct = (gasto_real / meta * 100) if meta else 0
+        if gasto_real <= meta:
+            return "✅", f"{pct:.0f}% do teto"
+        elif pct <= 110:
+            return "⚠️", f"{pct:.0f}% do teto"
+        else:
+            return "❌", f"{pct:.0f}% do teto"
+
+
+def gerar_insights(dre: pd.DataFrame, metas: dict, fmt_fn) -> dict:
+    """Analisa a DRE e devolve insights automáticos agrupados em
+    Destaques, Atenção e Sugestões — tudo calculado por regras simples
+    (variação mês a mês, metas, tendência de margem), sem IA externa."""
+    meses_local = list(dre.columns)
+    destaques, atencao, sugestoes = [], [], []
+
+    if len(meses_local) < 2:
+        return {"Destaques": [], "Atenção": [], "Sugestões": []}
+
+    linhas_detalhe = [l for l, t in DRE_LINES_ORDER if t == "detalhe"]
+
+    # 1) Variações bruscas mês a mês em qualquer linha de detalhe
+    variacoes_detectadas = []
+    for linha in linhas_detalhe:
+        serie = dre.loc[linha]
+        for i in range(1, len(meses_local)):
+            atual, anterior = serie.iloc[i], serie.iloc[i - 1]
+            mes_atual, mes_ant = meses_local[i], meses_local[i - 1]
+            if abs(anterior) < 1000:  # ignora bases muito pequenas (% explode sem sentido)
+                continue
+            variacao_pct = (atual - anterior) / abs(anterior) * 100
+            if abs(variacao_pct) >= 50:
+                variacoes_detectadas.append((abs(atual - anterior), linha, mes_atual, mes_ant, atual, anterior, variacao_pct))
+    # Prioriza pelas variações de maior impacto em R$, não só em %.
+    variacoes_detectadas.sort(key=lambda x: x[0], reverse=True)
+    for _, linha, mes_atual, mes_ant, atual, anterior, variacao_pct in variacoes_detectadas[:5]:
+        direcao = "aumentou" if abs(atual) > abs(anterior) else "caiu"
+        destaques.append(
+            f"📌 **{linha}** {direcao} {abs(variacao_pct):.0f}% em {mes_atual} "
+            f"({fmt_fn(atual)}) em relação a {mes_ant} ({fmt_fn(anterior)})."
+        )
+
+    # 2) Metas não atingidas com frequência
+    for linha, metas_linha in metas.items():
+        if not metas_linha or linha not in dre.index:
+            continue
+        falhas = []
+        for mes in meses_local:
+            meta_val = metas_linha.get(mes, 0.0)
+            if not meta_val:
+                continue
+            emoji, _ = status_meta(linha, dre.loc[linha, mes], meta_val)
+            if emoji == "❌":
+                falhas.append(mes)
+        meses_com_meta = [m for m in meses_local if metas_linha.get(m, 0.0)]
+        if meses_com_meta and len(falhas) >= max(2, len(meses_com_meta) // 2 + 1):
+            atencao.append(
+                f"⚠️ **{linha}** ficou fora da meta em {len(falhas)} de {len(meses_com_meta)} "
+                f"meses com meta definida ({', '.join(falhas)}) — vale revisar o teto/objetivo ou os gastos dessa linha."
+            )
+
+    # 3) Tendência de margem operacional (primeiro vs último mês)
+    receita_serie = dre.loc["Receita Bruta"]
+    lucro_serie = dre.loc["Lucro Operacional"]
+    margem_inicio = (lucro_serie.iloc[0] / receita_serie.iloc[0] * 100) if receita_serie.iloc[0] else None
+    margem_fim = (lucro_serie.iloc[-1] / receita_serie.iloc[-1] * 100) if receita_serie.iloc[-1] else None
+    if margem_inicio is not None and margem_fim is not None:
+        delta_margem = margem_fim - margem_inicio
+        if delta_margem >= 5:
+            destaques.append(
+                f"📈 A margem operacional melhorou de {margem_inicio:.1f}% ({meses_local[0]}) "
+                f"para {margem_fim:.1f}% ({meses_local[-1]})."
+            )
+        elif delta_margem <= -5:
+            atencao.append(
+                f"📉 A margem operacional caiu de {margem_inicio:.1f}% ({meses_local[0]}) "
+                f"para {margem_fim:.1f}% ({meses_local[-1]}) — vale investigar o motivo."
+            )
+
+    # 4) "Não Classificado" relevante (problema de dados, não do negócio)
+    if "Não Classificado" in dre.index:
+        for mes in meses_local:
+            nc = dre.loc["Não Classificado", mes]
+            receita_mes = dre.loc["Receita Bruta", mes]
+            if receita_mes and abs(nc) / abs(receita_mes) >= 0.03 and abs(nc) >= 500:
+                sugestoes.append(
+                    f"💡 Em {mes}, {fmt_fn(nc)} ficou em 'Não Classificado' "
+                    f"({abs(nc)/abs(receita_mes)*100:.1f}% da receita do mês) — mapeie essas "
+                    f"categorias no DRE_STRUCTURE para uma visão mais precisa."
+                )
+
+    # 5) Melhor e piores meses de caixa
+    caixa_serie = dre.loc["Geração de Caixa Realizada"]
+    mes_melhor = caixa_serie.idxmax()
+    mes_pior = caixa_serie.idxmin()
+    if mes_melhor != mes_pior:
+        destaques.append(f"🏆 Melhor geração de caixa: **{mes_melhor}** ({fmt_fn(caixa_serie[mes_melhor])}).")
+        if caixa_serie[mes_pior] < 0:
+            atencao.append(f"🔻 Pior geração de caixa: **{mes_pior}** ({fmt_fn(caixa_serie[mes_pior])}).")
+
+    # 6) Sugestão: linha de custo que mais cresceu em proporção à receita
+    if len(meses_local) >= 2:
+        maior_crescimento, linha_maior = 0, None
+        for linha in ["Custo Fixo", "Investimentos", "Despesas Financeiras", "Atividade de Financiamento"]:
+            if linha not in dre.index:
+                continue
+            pct_inicio = abs(dre.loc[linha, meses_local[0]]) / receita_serie.iloc[0] * 100 if receita_serie.iloc[0] else 0
+            pct_fim = abs(dre.loc[linha, meses_local[-1]]) / receita_serie.iloc[-1] * 100 if receita_serie.iloc[-1] else 0
+            crescimento = pct_fim - pct_inicio
+            if crescimento > maior_crescimento:
+                maior_crescimento, linha_maior = crescimento, linha
+        if linha_maior and maior_crescimento >= 5:
+            sugestoes.append(
+                f"💡 **{linha_maior}** cresceu {maior_crescimento:.1f} pontos percentuais como "
+                f"proporção da receita entre {meses_local[0]} e {meses_local[-1]} — é o maior "
+                f"candidato a revisão se o objetivo for melhorar a margem."
+            )
+
+    if not sugestoes:
+        sugestoes.append("✅ Nenhum ponto crítico de estrutura de custo identificado no período — continue monitorando.")
+
+    return {"Destaques": destaques, "Atenção": atencao, "Sugestões": sugestoes}
+
+
+def simular_metas(dre: pd.DataFrame, pivot_categoria: pd.DataFrame, meta_margem_pct: float,
+                   meta_caixa: float, num_socios: int = 1) -> dict:
+    """Calcula 'de trás para frente' o faturamento e os custos necessários
+    para atingir uma margem operacional mínima E uma geração de caixa alvo,
+    mantendo a folha de salários fixa (no patamar médio atual), os demais
+    custos administrativos fixos na média, e isolando o pró-labore como a
+    variável de ajuste dentro do orçamento administrativo — dividido pelo
+    número de sócios."""
+    meses_local = list(dre.columns)
+    n = len(meses_local)
+
+    avg_investimentos = dre.loc["Investimentos"].mean()
+    avg_despesas_fin = dre.loc["Despesas Financeiras"].mean()
+    avg_atividade_fin = dre.loc["Atividade de Financiamento"].mean()
+
+    receita_total = dre.loc["Receita Bruta"].sum()
+    tributos_total = dre.loc["Tributos"].sum()
+    taxa_tributos = abs(tributos_total) / receita_total if receita_total else 0
+
+    # Folha de salários (subgrupo dentro de Custo Fixo) — média histórica,
+    # mantida fixa na simulação, conforme pedido.
+    try:
+        folha_media = pivot_categoria.xs(
+            ("Custo Fixo", "Despesas com Folha - CMO"), level=("linha_dre", "subgrupo")
+        ).sum().mean()
+    except KeyError:
+        folha_media = 0.0
+
+    try:
+        admin_media_atual = pivot_categoria.xs(
+            ("Custo Fixo", "Despesa Operacional Administrativa"), level=("linha_dre", "subgrupo")
+        ).sum().mean()
+    except KeyError:
+        admin_media_atual = 0.0
+
+    # Pró-labore especificamente, dentro do subgrupo administrativo — é a
+    # variável de ajuste; o resto do administrativo fica fixo na média.
+    try:
+        prolabore_media_atual = pivot_categoria.xs(
+            "Despesas administrativas - pró-labore", level="categoria"
+        ).sum().mean()
+    except KeyError:
+        prolabore_media_atual = 0.0
+    outros_admin_media = admin_media_atual - prolabore_media_atual
+
+    if meta_margem_pct <= 0:
+        return {"erro": "A margem mínima precisa ser maior que 0%."}
+
+    margem_frac = meta_margem_pct / 100
+    lucro_operacional_necessario = meta_caixa - (avg_investimentos + avg_despesas_fin + avg_atividade_fin)
+    receita_sugerida = lucro_operacional_necessario / margem_frac
+    tributos_sugeridos = -taxa_tributos * receita_sugerida
+    receita_liquida_sugerida = receita_sugerida + tributos_sugeridos
+    custo_fixo_total_sugerido = lucro_operacional_necessario - receita_liquida_sugerida
+    admin_sugerido = custo_fixo_total_sugerido - folha_media
+    prolabore_sugerido_total = admin_sugerido - outros_admin_media
+    num_socios = max(1, num_socios)
+    prolabore_por_socio = prolabore_sugerido_total / num_socios
+
+    return {
+        "receita_sugerida": receita_sugerida,
+        "taxa_tributos": taxa_tributos,
+        "tributos_sugeridos": tributos_sugeridos,
+        "receita_liquida_sugerida": receita_liquida_sugerida,
+        "folha_media": folha_media,
+        "admin_sugerido": admin_sugerido,
+        "admin_media_atual": admin_media_atual,
+        "outros_admin_media": outros_admin_media,
+        "prolabore_media_atual": prolabore_media_atual,
+        "prolabore_sugerido_total": prolabore_sugerido_total,
+        "prolabore_por_socio": prolabore_por_socio,
+        "num_socios": num_socios,
+        "custo_fixo_total_sugerido": custo_fixo_total_sugerido,
+        "lucro_operacional_necessario": lucro_operacional_necessario,
+        "avg_investimentos": avg_investimentos,
+        "avg_despesas_fin": avg_despesas_fin,
+        "avg_atividade_fin": avg_atividade_fin,
+        "meta_caixa": meta_caixa,
+    }
+
+
+# =========================================================================
+# 6. INTERFACE — ESTILO EXECUTIVO
+# =========================================================================
+
+st.set_page_config(page_title="DRE Gerencial", layout="wide", page_icon="📊")
+
+st.markdown("""
+<style>
+    .block-container {padding-top: 2rem;}
+    div[data-testid="stMetric"] {
+        background-color: #F7F9FB;
+        border: 1px solid #E5E9EF;
+        border-radius: 10px;
+        padding: 16px 18px;
+        height: 118px !important;
+        box-sizing: border-box;
+        display: flex !important;
+        flex-direction: column !important;
+        justify-content: center !important;
+        overflow: hidden;
+    }
+    div[data-testid="stMetric"] > div {width: 100%;}
+    div[data-testid="stMetricLabel"] {font-size: 0.85rem; color: #5A6472;}
+    div[data-testid="column"] {display: flex; flex-direction: column;}
+    thead tr th {background-color: #1F2A44 !important; color: white !important;}
+    h1, h2, h3 {color: #1F2A44;}
+    .breakr-header {display:flex; align-items:center; gap:16px; margin-bottom:0.2rem;}
+    .breakr-header img {height:42px;}
+    .breakr-header h1 {margin:0; font-size:2rem;}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown(f"""
+<div class="breakr-header">
+    <img src="data:image/png;base64,{BREAKR_LOGO_B64}" alt="Breakr">
+    <h1>DRE Gerencial — Breakr Assessoria</h1>
+</div>
+""", unsafe_allow_html=True)
+st.caption("Dados sincronizados automaticamente com o Nibo")
+
+token, org_id = get_credentials()
+
+with st.sidebar:
+    st.header("Filtros")
+    hoje = datetime.today()
+    data_inicio = st.date_input("Data inicial", value=hoje.replace(day=1) - timedelta(days=180))
+    data_fim = st.date_input("Data final", value=hoje)
+    regime = st.radio(
+        "Regime de apresentação",
+        options=["Competência", "Caixa (data de pagamento)"],
+        help="Competência: agrupa pelo mês de competência do lançamento "
+             "(igual ao Painel de acompanhamento nativo do Nibo). "
+             "Caixa: agrupa pelo mês do Vencimento no Nibo — funciona bem "
+             "se, ao dar baixa em cada conta, o Vencimento for ajustado "
+             "para bater com a data real do pagamento.",
+    )
+    if st.button("🔄 Atualizar dados", use_container_width=True):
+        st.cache_data.clear()
+    st.divider()
+    st.caption("Fonte: API Nibo · Atualização automática a cada 1h (cache)")
+
+buffer_dias = timedelta(days=45)
+date_from_str = (data_inicio - buffer_dias).strftime("%Y-%m-%dT00:00:00Z")
+date_to_str = (data_fim + buffer_dias).strftime("%Y-%m-%dT23:59:59Z")
+
+with st.spinner("Buscando lançamentos no Nibo..."):
+    df_raw = fetch_schedules(token, org_id, date_from_str, date_to_str)
+
+st.caption(f"📐 Regime: **{regime}**")
+
+if df_raw.empty:
+    st.warning("Nenhum lançamento retornado para o período selecionado.")
+    st.stop()
+
+# Calcula o "mês" de cada lançamento de acordo com o regime escolhido —
+# não precisa buscar de novo na API, só reagrupar os dados já carregados.
+data_ref = df_raw["data_competencia"] if regime == "Competência" else df_raw["data_pagamento"]
+df_raw = df_raw.copy()
+df_raw["mes"] = data_ref.dt.to_period("M").astype(str)
+
+# Descarta a margem de segurança: mantém só os meses dentro do período que
+# o usuário realmente selecionou nos filtros.
+mes_min_real = data_inicio.strftime("%Y-%m")
+mes_max_real = data_fim.strftime("%Y-%m")
+df_raw = df_raw[(df_raw["mes"] >= mes_min_real) & (df_raw["mes"] <= mes_max_real)]
+
+if df_raw.empty:
+    st.warning("Nenhum lançamento no período selecionado (após ajuste de competência/caixa).")
+    st.stop()
+
+
+def fmt_moeda(v):
+    if pd.isna(v):
+        v = 0.0
+    sinal = "-" if v < 0 else ""
+    return f"{sinal}R$ {abs(v):,.0f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def md(texto: str) -> str:
+    """Escapa o cifrão para exibição segura em st.markdown/warning/success/
+    error — sem isso, o Streamlit interpreta pares de '$' como fórmula
+    matemática (LaTeX) e quebra o texto quando há mais de um valor em R$
+    na mesma frase."""
+    return texto.replace("$", "\\$")
+
+
+pivot_categoria = build_pivot_por_categoria(df_raw)
+dre = build_dre(pivot_categoria)
+
+if dre.empty or len(dre.columns) == 0:
+    st.warning(
+        "Lançamentos encontrados, mas nenhuma categoria bateu com a DRE_STRUCTURE. "
+        "Confira os nomes exatos das categorias abaixo e ajuste o dicionário "
+        "DRE_STRUCTURE no topo do app.py."
+    )
+    resumo_categorias = (
+        df_raw.groupby("categoria")["valor"]
+        .agg(qtd_lancamentos="count", valor_total="sum")
+        .sort_values("valor_total", ascending=False)
+        .reset_index()
+    )
+    st.dataframe(resumo_categorias, use_container_width=True)
+    botao_exportar(resumo_categorias, "categorias_nao_mapeadas")
+    st.stop()
+
+meses = list(dre.columns)
+ultimo_mes = meses[-1]
+mes_anterior = meses[-2] if len(meses) > 1 else None
+
+metas_atuais = carregar_metas()
+
+with st.expander("🧠 Insights automáticos do período", expanded=False):
+    insights = gerar_insights(dre, metas_atuais, fmt_moeda)
+    cols_insight = st.columns(3)
+    titulos = ["📈 Destaques", "⚠️ Atenção", "💡 Sugestões"]
+    chaves = ["Destaques", "Atenção", "Sugestões"]
+    for col, titulo, chave in zip(cols_insight, titulos, chaves):
+        with col:
+            st.markdown(f"**{titulo}**")
+            itens = insights[chave]
+            if not itens:
+                st.caption("Nada relevante identificado.")
+            else:
+                for item in itens:
+                    st.markdown(f"- {md(item)}")
+
+with st.expander("🎯 Simulador de metas — quanto preciso faturar e gastar?", expanded=False):
+    st.caption(
+        "Define a margem operacional mínima e a geração de caixa que você quer atingir "
+        "por mês. O app calcula, de trás para frente, o faturamento necessário e o "
+        "orçamento sugerido para cada linha — mantendo a **folha de salários** no "
+        "patamar médio atual e os **Tributos** proporcionais à receita (calculados "
+        "automaticamente, não são um valor fixo a definir)."
+    )
+    sc1, sc2, sc3 = st.columns(3)
+    with sc1:
+        meta_margem_input = st.number_input(
+            "Margem Operacional mínima desejada (%)", min_value=0.1, max_value=95.0,
+            value=40.0, step=1.0,
+        )
+    with sc2:
+        meta_caixa_input = st.number_input(
+            "Geração de Caixa desejada por mês (R$)", min_value=0.0, value=20000.0, step=1000.0,
+        )
+    with sc3:
+        num_socios_input = st.number_input(
+            "Número de sócios (para dividir o pró-labore)", min_value=1, max_value=20,
+            value=1, step=1,
+        )
+
+    sim = simular_metas(dre, pivot_categoria, meta_margem_input, meta_caixa_input, int(num_socios_input))
+
+    if "erro" in sim:
+        st.error(sim["erro"])
+    else:
+        st.markdown("#### 📋 Plano sugerido (valor por mês)")
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Receita Bruta necessária", fmt_moeda(sim["receita_sugerida"]))
+        p2.metric("Tributos (estimado)", fmt_moeda(sim["tributos_sugeridos"]),
+                   f"{sim['taxa_tributos']*100:.1f}% da receita")
+        p3.metric("Receita Líquida", fmt_moeda(sim["receita_liquida_sugerida"]))
+        p4.metric("Lucro Operacional", fmt_moeda(sim["lucro_operacional_necessario"]))
+
+        st.markdown("#### 💰 Orçamento de Custo Fixo")
+        cf1, cf2, cf3 = st.columns(3)
+        cf1.metric("Folha de Salários (fixo — média atual)", fmt_moeda(sim["folha_media"]))
+        delta_admin = sim["admin_sugerido"] - sim["admin_media_atual"]
+        cf2.metric(
+            "Despesas Administrativas sugerido", fmt_moeda(sim["admin_sugerido"]),
+            f"{fmt_moeda(delta_admin)} vs. média atual ({fmt_moeda(sim['admin_media_atual'])})",
+            delta_color="inverse",
+        )
+        cf3.metric("Custo Fixo total permitido", fmt_moeda(sim["custo_fixo_total_sugerido"]))
+
+        st.markdown("#### 👤 Pró-labore sugerido")
+        st.caption(
+            "Isola o pró-labore dentro do orçamento administrativo, mantendo os demais "
+            "custos administrativos (contabilidade, jurídico, licenças etc.) fixos na "
+            "média histórica — o pró-labore é quem absorve o ajuste."
+        )
+        pl1, pl2, pl3 = st.columns(3)
+        pl1.metric("Outras despesas administrativas (fixo)", fmt_moeda(sim["outros_admin_media"]))
+        delta_prolabore = sim["prolabore_sugerido_total"] - sim["prolabore_media_atual"]
+        pl2.metric(
+            "Pró-labore total sugerido", fmt_moeda(sim["prolabore_sugerido_total"]),
+            f"{fmt_moeda(delta_prolabore)} vs. atual ({fmt_moeda(sim['prolabore_media_atual'])})",
+            delta_color="inverse",
+        )
+        pl3.metric(
+            f"Pró-labore por sócio ({sim['num_socios']}x)",
+            fmt_moeda(abs(sim["prolabore_por_socio"])),
+        )
+        if sim["prolabore_sugerido_total"] > 0:
+            st.error(
+                "❌ Esse cenário exigiria pró-labore **positivo** (ou seja, negativo como "
+                "custo não sobra orçamento nenhum) — a meta de margem/caixa não é viável "
+                "sem cortar outras despesas administrativas ou aumentar mais o faturamento."
+            )
+
+        st.markdown("#### 📦 Orçamento sugerido (mantido no patamar médio histórico)")
+        b1, b2, b3 = st.columns(3)
+        b1.metric("Investimentos", fmt_moeda(sim["avg_investimentos"]))
+        b2.metric("Despesas Financeiras", fmt_moeda(sim["avg_despesas_fin"]))
+        b3.metric("Atividade de Financiamento", fmt_moeda(sim["avg_atividade_fin"]))
+
+        if delta_admin < 0:
+            st.warning(md(
+                f"⚠️ Para bater essa meta mantendo o faturamento sugerido, as despesas "
+                f"administrativas (incluindo pró-labore) precisam **cair {fmt_moeda(abs(delta_admin))}** "
+                f"em relação à média atual. Se não for viável cortar, o caminho é aumentar "
+                f"o faturamento além do valor sugerido."
+            ))
+        else:
+            st.success(md(
+                f"✅ Nesse cenário, as despesas administrativas têm folga de "
+                f"{fmt_moeda(delta_admin)} em relação à média atual."
+            ))
+
+        plano_df = pd.DataFrame({
+            "Linha": ["Receita Bruta", "Tributos", "Receita Líquida", "Folha de Salários",
+                      "Outras Despesas Administrativas", "Pró-labore Total Sugerido",
+                      f"Pró-labore por sócio ({sim['num_socios']}x)",
+                      "Despesas Administrativas (Total)", "Custo Fixo Total", "Lucro Operacional",
+                      "Investimentos", "Despesas Financeiras", "Atividade de Financiamento",
+                      "Geração de Caixa (meta)"],
+            "Valor Sugerido": [
+                sim["receita_sugerida"], sim["tributos_sugeridos"], sim["receita_liquida_sugerida"],
+                sim["folha_media"], sim["outros_admin_media"], sim["prolabore_sugerido_total"],
+                sim["prolabore_por_socio"], sim["admin_sugerido"], sim["custo_fixo_total_sugerido"],
+                sim["lucro_operacional_necessario"], sim["avg_investimentos"], sim["avg_despesas_fin"],
+                sim["avg_atividade_fin"], sim["meta_caixa"],
+            ],
+        })
+        botao_exportar(plano_df, "plano_de_metas", label="⬇️ Exportar plano sugerido")
+
+        st.divider()
+        st.caption(
+            "O botão abaixo preenche a tabela de metas (seção '🎯 Definir metas por "
+            "linha') com este plano, repetido em todos os meses do período — assim os "
+            "✅⚠️❌ na DRE já refletem se cada mês está no caminho para bater essa meta."
+        )
+        if st.button("✅ Usar este plano como meta para todos os meses", use_container_width=True):
+            novas_metas = {
+                "Receita Bruta": {m: sim["receita_sugerida"] for m in meses},
+                "Tributos": {m: abs(sim["tributos_sugeridos"]) for m in meses},
+                "Receita Líquida": {m: sim["receita_liquida_sugerida"] for m in meses},
+                "Custo Fixo": {m: abs(sim["custo_fixo_total_sugerido"]) for m in meses},
+                "Lucro Operacional": {m: sim["lucro_operacional_necessario"] for m in meses},
+                "Investimentos": {m: abs(sim["avg_investimentos"]) for m in meses},
+                "Despesas Financeiras": {m: abs(sim["avg_despesas_fin"]) for m in meses},
+                "Atividade de Financiamento": {m: abs(sim["avg_atividade_fin"]) for m in meses},
+                "Não Classificado": {m: 0.0 for m in meses},
+                "Geração de Caixa Realizada": {m: sim["meta_caixa"] for m in meses},
+            }
+            if salvar_metas(novas_metas):
+                st.success("Metas aplicadas a todos os meses! Role até a tabela DRE para ver os ✅⚠️❌.")
+                st.rerun()
+            else:
+                st.error("Não consegui salvar as metas em disco.")
+
+
+def variacao(atual, anterior):
+    if anterior in (0, None) or pd.isna(anterior):
+        return None
+    return (atual - anterior) / abs(anterior) * 100
+
+
+# ---- KPIs ----
+st.subheader(f"Indicadores — {ultimo_mes}")
+k1, k2, k3, k4, k5 = st.columns(5)
+
+receita = dre.loc["Receita Bruta", ultimo_mes]
+lucro_op = dre.loc["Lucro Operacional", ultimo_mes]
+caixa = dre.loc["Geração de Caixa Realizada", ultimo_mes]
+margem_op = (lucro_op / receita * 100) if receita else 0
+margem_caixa = (caixa / receita * 100) if receita else 0
+
+receita_ant = dre.loc["Receita Bruta", mes_anterior] if mes_anterior else None
+caixa_ant = dre.loc["Geração de Caixa Realizada", mes_anterior] if mes_anterior else None
+lucro_op_ant = dre.loc["Lucro Operacional", mes_anterior] if mes_anterior else None
+
+k1.metric("Receita Bruta", fmt_moeda(receita),
+          f"{variacao(receita, receita_ant):.1f}%" if variacao(receita, receita_ant) is not None else None)
+k2.metric("Lucro Operacional", fmt_moeda(lucro_op), f"{margem_op:.1f}% margem")
+k3.metric("Variação Lucro Op.",
+          f"{variacao(lucro_op, lucro_op_ant):.1f}%" if variacao(lucro_op, lucro_op_ant) is not None else "—")
+k4.metric("Caixa Gerado", fmt_moeda(caixa),
+          f"{variacao(caixa, caixa_ant):.1f}%" if variacao(caixa, caixa_ant) is not None else None)
+k5.metric("Meses no período", f"{len(meses)}")
+
+st.markdown("<div style='height: 14px;'></div>", unsafe_allow_html=True)
+
+
+def gauge_kpi(titulo, valor_pct, valor_abs_fmt, faixa_max=60):
+    """Gauge circular estilo Power BI/dashboard executivo."""
+    cor = BREAKR_AMARELO if valor_pct >= 0 else BREAKR_VERMELHO
+    limite = max(abs(valor_pct) * 1.3, faixa_max)
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=valor_pct,
+        number={"suffix": "%", "font": {"size": 44, "color": cor}},
+        gauge={
+            "axis": {"range": [-limite, limite], "tickcolor": "#5A6472", "tickfont": {"size": 10}},
+            "bar": {"color": cor, "thickness": 0.28},
+            "bgcolor": "white",
+            "borderwidth": 0,
+            "threshold": {"line": {"color": BREAKR_PRETO, "width": 3}, "thickness": 0.75, "value": valor_pct},
+        },
+        domain={"x": [0, 1], "y": [0, 1]},
+    ))
+    fig.update_layout(height=200, margin=dict(t=20, b=0, l=30, r=30))
+    st.markdown(f"<p style='text-align:center; font-weight:700; font-size:1.05rem; "
+                f"color:#1F2A44; margin-bottom:0;'>{titulo}</p>", unsafe_allow_html=True)
+    st.plotly_chart(fig, use_container_width=True)
+    st.markdown(f"<p style='text-align:center; font-size:0.85rem; color:#5A6472; "
+                f"margin-top:-10px;'>{md(valor_abs_fmt)}</p>", unsafe_allow_html=True)
+
+
+kc1, kc2 = st.columns(2)
+with kc1:
+    gauge_kpi("Margem Operacional sobre Faturamento", margem_op,
+              f"Lucro Op. {fmt_moeda(lucro_op)} ÷ Receita {fmt_moeda(receita)}")
+with kc2:
+    gauge_kpi("Caixa Gerado sobre Faturamento", margem_caixa,
+              f"Caixa {fmt_moeda(caixa)} ÷ Receita {fmt_moeda(receita)}")
+
+
+st.divider()
+
+# ---- Metas por linha (mês a mês) ----
+with st.expander("🎯 Definir metas por linha (mês a mês)"):
+    st.caption(
+        "Para linhas de Receita/Lucro/Caixa, a meta é um valor a **superar**. "
+        "Para linhas de custo (Tributos, Custo Fixo, Investimentos, "
+        "Despesas Financeiras, Atividade de Financiamento), a meta é um "
+        "**teto de gasto** — digite sempre um número positivo, mesmo para "
+        "linhas de custo."
+    )
+    metas_salvas = carregar_metas()
+    linhas_todas = [l for l, _ in DRE_LINES_ORDER]
+    metas_df = pd.DataFrame(
+        {mes: [metas_salvas.get(linha, {}).get(mes, 0.0) for linha in linhas_todas] for mes in meses},
+        index=linhas_todas,
+    )
+    metas_editadas = st.data_editor(
+        metas_df, use_container_width=True,
+        column_config={mes: st.column_config.NumberColumn(mes, format="%.0f") for mes in meses},
+        key="editor_metas",
+    )
+    col_salvar, col_export, col_import = st.columns([1, 1, 2])
+    with col_salvar:
+        if st.button("💾 Salvar metas"):
+            novas_metas = {
+                linha: {mes: float(metas_editadas.loc[linha, mes]) for mes in meses}
+                for linha in linhas_todas
+            }
+            if salvar_metas(novas_metas):
+                st.success("Metas salvas!")
+            else:
+                st.error("Não consegui salvar em disco — exporta para Excel como backup.")
+    with col_export:
+        botao_exportar(metas_editadas, "metas_dre", label="⬇️ Exportar metas")
+    with col_import:
+        arquivo_metas = st.file_uploader("Importar metas (.xlsx)", type=["xlsx"], key="upload_metas")
+        if arquivo_metas is not None:
+            df_importado = pd.read_excel(arquivo_metas, index_col=0)
+            metas_importadas = {
+                linha: {mes: float(df_importado.loc[linha, mes]) for mes in df_importado.columns if linha in df_importado.index}
+                for linha in linhas_todas
+            }
+            if salvar_metas(metas_importadas):
+                st.success("Metas importadas! Atualize a página para ver refletido na tabela.")
+
+metas_atuais = carregar_metas()
+
+st.divider()
+
+# ---- Tabela DRE comparativa ----
+st.subheader("DRE Comparativa Mês a Mês")
+
+dre_display_fmt = dre.copy().map(fmt_moeda)
+
+margem_op_row = (dre.loc["Lucro Operacional"] / dre.loc["Receita Bruta"].replace(0, pd.NA) * 100).round(1)
+for mes in meses:
+    if pd.notna(margem_op_row[mes]):
+        dre_display_fmt.loc["Lucro Operacional", mes] += f"  ({margem_op_row[mes]:.1f}%)"
+
+# Anexa o ícone de status (✅/⚠️/❌) em cada célula que tiver meta definida.
+for linha in dre.index:
+    metas_linha = metas_atuais.get(linha, {})
+    for mes in meses:
+        meta_val = metas_linha.get(mes, 0.0)
+        if meta_val:
+            emoji, _texto = status_meta(linha, dre.loc[linha, mes], meta_val)
+            if emoji:
+                dre_display_fmt.loc[linha, mes] += f" {emoji}"
+
+# Monta a tabela final intercalando uma linha "🎯 Meta" abaixo de qualquer
+# linha que tenha meta definida em pelo menos um mês do período.
+linhas_subtotal = {"Receita Líquida", "Lucro Operacional", "Geração de Caixa Realizada"}
+linhas_com_meta_rotulo = set()
+index_labels, linhas_dados = [], []
+for linha, tipo in DRE_LINES_ORDER:
+    prefixo = "🔹 " if tipo == "subtotal" else "   "
+    rotulo_realizado = prefixo + linha
+    index_labels.append(rotulo_realizado)
+    linhas_dados.append(dre_display_fmt.loc[linha].tolist())
+
+    metas_linha = metas_atuais.get(linha, {})
+    if any(metas_linha.get(m, 0.0) for m in meses):
+        rotulo_meta = "      🎯 Meta"
+        index_labels.append(rotulo_meta)
+        linhas_dados.append([
+            fmt_moeda(metas_linha.get(m, 0.0)) if metas_linha.get(m, 0.0) else "—"
+            for m in meses
+        ])
+        linhas_com_meta_rotulo.add(rotulo_meta)
+
+dre_display_fmt = pd.DataFrame(linhas_dados, index=index_labels, columns=meses)
+
+
+def destacar_totalizadores(row):
+    nome_linha = row.name.replace("🔹 ", "").strip()
+    if row.name in linhas_com_meta_rotulo:
+        return ["color: #8A94A6; font-style: italic;"] * len(row)
+    if nome_linha in linhas_subtotal:
+        return ["background-color: #EAF3FF; color: #1F2A44; font-weight: 700;"] * len(row)
+    return [""] * len(row)
+
+
+styler = dre_display_fmt.style.apply(destacar_totalizadores, axis=1)
+st.dataframe(styler, use_container_width=True)
+st.caption("✅ Meta atingida · ⚠️ Perto da meta (dentro de 10%) · ❌ Fora da meta · 🎯 Meta definida — defina metas no expansor acima.")
+botao_exportar(dre, "dre_gerencial", label="⬇️ Exportar DRE completa para Excel")
+
+st.divider()
+
+# ---- Drill-down: composição de cada linha ----
+st.subheader("🔍 Composição de cada linha (clique para expandir)")
+st.caption("Mostra quanto cada subgrupo/categoria real do Nibo contribuiu, mês a mês.")
+
+for linha, _tipo in DRE_LINES_ORDER:
+    if linha not in DRE_STRUCTURE and linha != "Não Classificado":
+        continue  # subtotais não têm composição própria
+
+    titulo = f"{linha} — composição"
+    if linha == "Não Classificado":
+        titulo = "⚠️ Não Classificado — categorias que ainda não estão em nenhum grupo da DRE"
+
+    with st.expander(titulo):
+        try:
+            sub = pivot_categoria.xs(linha, level="linha_dre")
+        except KeyError:
+            sub = None
+        if sub is None or sub.empty:
+            st.caption("Nenhum lançamento nessa linha no período selecionado.")
+            continue
+
+        sub = sub.reindex(columns=meses, fill_value=0.0)
+        subgrupos_distintos = sub.index.get_level_values("subgrupo").unique()
+
+        # Se a linha tem mais de um subgrupo real (não é só o nome da própria
+        # linha repetido), mostra também o resumo por subgrupo antes do detalhe.
+        tem_subgrupos_reais = len(subgrupos_distintos) > 1 or subgrupos_distintos[0] != linha
+        if tem_subgrupos_reais:
+            st.markdown("**Resumo por subgrupo:**")
+            por_sub = sub.groupby(level="subgrupo").sum()
+            por_sub = por_sub.loc[por_sub.sum(axis=1).sort_values(ascending=False).index]
+            por_sub_fmt = por_sub.map(fmt_moeda)
+            por_sub_fmt.insert(0, "Total no período", por_sub.sum(axis=1).apply(fmt_moeda))
+            st.dataframe(por_sub_fmt, use_container_width=True)
+            botao_exportar(por_sub, f"{linha}_subgrupos".replace(" ", "_"), label="⬇️ Exportar subgrupos")
+            st.markdown("**Detalhe por categoria:**")
+
+        detalhe = sub.droplevel("subgrupo") if "subgrupo" in sub.index.names else sub
+        detalhe = detalhe.loc[detalhe.sum(axis=1).sort_values(ascending=False).index]
+        detalhe_fmt = detalhe.map(fmt_moeda)
+        detalhe_fmt.insert(0, "Total no período", detalhe.sum(axis=1).apply(fmt_moeda))
+        st.dataframe(detalhe_fmt, use_container_width=True)
+        botao_exportar(detalhe, f"{linha}_categorias".replace(" ", "_"), label="⬇️ Exportar categorias")
+
+st.divider()
+
+# ---- Gráficos ----
+c1, c2 = st.columns(2)
+
+with c1:
+    st.subheader("Receita x Lucro Operacional")
+    fig1 = go.Figure()
+    fig1.add_trace(go.Bar(x=meses, y=dre.loc["Receita Bruta"], name="Receita Bruta", marker_color=BREAKR_PRETO))
+    fig1.add_trace(go.Scatter(x=meses, y=dre.loc["Lucro Operacional"], name="Lucro Operacional",
+                               mode="lines+markers", line=dict(color=BREAKR_AMARELO, width=3)))
+    fig1.update_layout(height=380, margin=dict(t=20, b=20, l=10, r=10),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02))
+    st.plotly_chart(fig1, use_container_width=True)
+
+with c2:
+    st.subheader("Tendência de Caixa")
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(x=meses, y=dre.loc["Geração de Caixa Realizada"], name="Caixa Gerado",
+                               mode="lines+markers", fill="tozeroy",
+                               line=dict(color=BREAKR_AMARELO, width=3)))
+    fig2.update_layout(height=380, margin=dict(t=20, b=20, l=10, r=10))
+    st.plotly_chart(fig2, use_container_width=True)
+
+c3, c4 = st.columns(2)
+
+with c3:
+    st.subheader("Custo Fixo x Investimentos x Despesas Financeiras")
+    fig3 = go.Figure()
+    fig3.add_trace(go.Bar(x=meses, y=-dre.loc["Custo Fixo"], name="Custo Fixo", marker_color=BREAKR_VERMELHO))
+    fig3.add_trace(go.Bar(x=meses, y=-dre.loc["Investimentos"], name="Investimentos", marker_color=BREAKR_AMARELO))
+    fig3.add_trace(go.Bar(x=meses, y=-dre.loc["Despesas Financeiras"], name="Despesas Financeiras",
+                           marker_color=BREAKR_VERMELHO))
+    fig3.update_layout(height=380, barmode="group", margin=dict(t=20, b=20, l=10, r=10),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02))
+    st.plotly_chart(fig3, use_container_width=True)
+
+with c4:
+    st.subheader("Margem Operacional (%)")
+    fig4 = go.Figure()
+    fig4.add_trace(go.Scatter(x=meses, y=margem_op_row, name="Margem Operacional %",
+                               mode="lines+markers", line=dict(color=BREAKR_AMARELO, width=3)))
+    fig4.update_layout(height=380, margin=dict(t=20, b=20, l=10, r=10),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02))
+    st.plotly_chart(fig4, use_container_width=True)
+
+st.caption("⚠️ Valores em regime de caixa (proporcional ao que já foi efetivamente pago/recebido no Nibo). "
+           "Revise DRE_STRUCTURE no início do app.py para ajustar o mapeamento de categorias.")
+
+st.divider()
+
+with st.expander("🔬 Diagnóstico — total bruto por mês (para comparar com o relatório do Nibo)"):
+    st.caption(
+        "Esta tabela soma TUDO que a API retornou, com o sinal do campo "
+        "'tipo_cat' (entrada/saída), antes de qualquer classificação de "
+        "DRE. Se o total de algum mês aqui já não bater com o total de "
+        "movimentações que você vê no próprio Nibo para o mesmo mês, o "
+        "problema é na busca de dados (API/filtro), não na classificação."
+    )
+    df_diag = df_raw.copy()
+    df_diag["valor_sinal"] = df_diag.apply(
+        lambda r: r["valor"] * (1 if r["tipo_cat"] == "in" else -1), axis=1
+    )
+    diag = df_diag.groupby("mes").agg(
+        total_liquido=("valor_sinal", "sum"),
+        qtd_lancamentos=("valor_sinal", "count"),
+        total_entradas=("valor_sinal", lambda s: s[s > 0].sum()),
+        total_saidas=("valor_sinal", lambda s: s[s < 0].sum()),
+    ).reset_index()
+    diag_fmt = diag.copy()
+    for col in ["total_liquido", "total_entradas", "total_saidas"]:
+        diag_fmt[col] = diag_fmt[col].apply(fmt_moeda)
+    st.dataframe(diag_fmt, use_container_width=True)
+    botao_exportar(diag, "diagnostico_totais_por_mes")
