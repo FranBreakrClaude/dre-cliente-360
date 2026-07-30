@@ -23,130 +23,199 @@ from datetime import datetime, timedelta
 
 # =========================================================================
 # 1. ESTRUTURA DA DRE — Grupo/Subgrupo/Categoria (plano de contas real da
-#    GC - Marketing & Gestão Estratégica, exportado do Nibo)
+#    360 SUSHI LOUNGE LTDA, exportado do Nibo)
 # =========================================================================
 #
-# Cada linha da DRE_STRUCTURE tem "sinal" (+1 entrada / -1 saída) e OU:
-#   - "categorias": lista simples de categorias do Nibo, OU
-#   - "subgrupos": dict {nome_subgrupo: [categorias...]} quando a linha tem
-#     mais de um nível de composição (ex.: Custo Fixo)
+# Mesma lógica usada no painel da Breakr, adaptada às categorias reais
+# desta empresa (restaurante/delivery — tem CMV de mercadoria, diferente
+# de uma empresa de serviços):
+#   - "Fornecedores" = CMV (custo da mercadoria vendida) — subgrupo próprio
+#     dentro de Custo Fixo, ao lado de Folha (CMO) e Administrativa.
+#   - "Folha" = CMO (custo de mão de obra), como no modelo da Breakr.
+#   - Tudo que começa com "Receita" entra em Receita Bruta.
 #
-# Mudanças estruturais desta versão (confirmadas com o usuário):
-#   - "Custo Fixo" passa a ser um grupo único com 2 subgrupos (Despesas
-#     Administrativas + Folha/CMO), substituindo a separação anterior
-#     entre CSP e Despesas Operacionais. Por isso não há mais uma linha
-#     "Lucro Bruto" distinta — vai direto de Receita Líquida para Lucro
-#     Operacional.
-#   - "Financeira - tarifas bancárias" saiu de Tributos e entrou no novo
-#     grupo "Despesas Financeiras".
-#   - "Despesas administrativas - pró-labore" agora está incluída no
-#     subgrupo administrativo do Custo Fixo.
+# ⚠️ Duas categorias do plano de contas desta empresa aparecem duplicadas
+# em Grupos diferentes do Nibo, com sinais conflitantes ("Financeira -
+# estornos" e "Descontos Recebidos" aparecem como Entrada em um lugar e
+# não-classificadas em outro). Para não arriscar somar com o sinal errado,
+# deixei essas DE FORA do mapeamento — elas caem em "Não Classificado",
+# onde o sistema usa o tipo (entrada/saída) de cada lançamento individual
+# para acertar o sinal automaticamente, em vez de um sinal fixo.
+#
+# Também criei uma linha nova, "Captação de Recursos" (+), para separar
+# entradas de financiamento (aporte de capital, empréstimos obtidos) das
+# saídas de financiamento (retiradas, pagamentos de empréstimo) — no plano
+# de contas original ambas ficam misturadas em "Atividades de
+# financiamento", mas com sinais opostos.
 
 DRE_STRUCTURE = {
     "Receita Bruta": {
         "sinal": 1,
         "categorias": [
-            "Receita com vendas - Boleto",
-            "Receita com vendas - cartão de crédito",
-            "Financeira - receita financeira",
+            "Receita com vendas - Dinheiro",
             "Receita com vendas - pix",
+            "Receita com vendas - cartão de débito",
+            "Receita com vendas - cartão de crédito",
+            "Receita com vendas - ifood",
+            "Receita com vendas - aiqfome",
+            "Receita com vendas - pix tuna",
+            "Receita com vendas - PagSeguro",
+            "Outras receitas",
+            "Multas Recebidas",
+            "Juros Recebidos",
+            "Financeira - receita financeira",
+            "Financeira - rendimento de aplicação",
+            "Venda de ativo fixo",
         ],
     },
     "Tributos": {  # redutor de receita / impostos e custos sobre venda
         "sinal": -1,
         "categorias": [
             "Tributos - simples nacional",
-            "Custo com cobrança - boleto",
-            "Custo meio de emissão NF",
-            "Custo meio de pagamento - máquina crédito",
+            "Tributos - simples nacional - parcelamento",
+            "Tributos - cofins",
+            "Tributos - darf",
+            "Tributos - icms",
+            "Tributos - pis",
+            "Tributos - irpj",
+            "Tributos - csll",
+            "Tributos - iss",
+            "Custo meio de pagamento - ifood",
+            "Custo meio de pagamento - aiqfome",
             "Custo meio de pagamento - máquina crédito à vista",
             "Custo meio de pagamento - máquina débito",
             "Custo meio de pagamento - máquina pix",
+            "Custo com Delivery",
+            "Comissão sobre vendas",
+            "Frete sobre vendas",
+            "Descontos Concedidos",
         ],
     },
     "Custo Fixo": {
         "sinal": -1,
         "subgrupos": {
-            "Despesa Operacional Administrativa": [
+            "Fornecedores - CMV": [
                 "Custos operacionais - a identificar",
-                "Despesas Administrativas - Cartão de Crédito",
-                "Despesas administrativas - certificado digital",
-                "Despesas administrativas - Confraternização Equipe",
-                "Despesas administrativas - contabilidade",
-                "Despesas administrativas - copa e cozinha",
-                "Despesas administrativas - escritório de advocacia",
-                "Despesas administrativas - eventos",
-                "Despesas administrativas - farmáxia",
-                "Despesas administrativas - Gráfica",
-                "Despesas administrativas - informática",
-                "Despesas administrativas - jurídico",
-                "Despesas administrativas - licenças e software",
-                "Despesas administrativas - material de escritório",
-                "Despesas administrativas - Medicina do Trabalho",
-                "Despesas administrativas - Patrocinios",
-                "Despesas administrativas - pró-labore",
-                "Despesas administrativas - serviço de limpeza",
-                "Despesas administrativas - serviço de terceiros",
-                "Despesas administrativas - telefonia e internet",
-                "Despesas administrativas - transporte urbano",
-                "Despesas administrativas - uniforme",
-                "Despesas administrativas - viagem",
-                "Despesas com instalação - água e esgoto",
-                "Despesas com instalação - aluguel",
-                "Despesas com instalação - energia elétrica",
-                "Despesas com instalação - iptu",
-                "Despesas com instalação - manutenção e conservação",
-                "Despesas com instalação - segurança e monitorament",
+                "Fornecedores - compra de mercadorias",
+                "Fornecedores - embalagens",
+                "Fornecedores - insumos produção",
+                "Fornecedores - mão de obra produção",
+                "Custo com embalagens",
+                "Cliente - devolução de vendas",
             ],
             "Despesas com Folha - CMO": [
+                "Folha - salários",
                 "Folha - adiantamento de salários",
-                "Folha - cursos e treinamentos",
+                "Folha - rescisões",
+                "Folha - férias",
+                "Folha - 13º salário",
                 "Folha - fgts",
                 "Folha - inss",
-                "Folha - plano de saúde",
-                "Folha - rescisões",
-                "Folha - salários",
+                "Folha - salário freelancer salão",
+                "Folha - vale refeição",
+                "Folha - bonificação funcionários",
                 "Folha - vale alimentação",
                 "Folha - vale transporte",
+                "Folha - cursos e treinamentos",
+                "Folha - plano de saúde",
+                "Folha - benefício de aluguel",
+                "Folha - salário freelancer motoboy",
+                "Folha - salário freelancer cozinha",
+                "Folha - salário freelancer louça",
+                "Folha free Delivery",
+            ],
+            "Despesa Operacional Administrativa": [
+                "Taxas e contribuições",
+                "Despesas com instalação - aluguel",
+                "Despesas com instalação - condomínio",
+                "Despesas com instalação - água e esgoto",
+                "Despesas com instalação - energia elétrica",
+                "Despesas com instalação - manutenção e conservação",
+                "Despesas com instalação - segurança e monitorament",
+                "Despesas com instalação - iptu",
+                "Despesas com instalação - combustivel",
+                "Despesas administrativas - pró-labore",
+                "Despesas administrativas - telefonia e internet",
+                "Despesas administrativas - copa e cozinha",
+                "Despesas administrativas - brindes e bonificações",
+                "Despesas administrativas - marcas e patentes",
+                "Custos com Eventos",
+                "Despesas administrativas - material de escritório",
+                "Despesas administrativas - uniformes",
+                "Despesas administrativas - cartório",
+                "Despesas administrativas - informática",
+                "Despesas administrativas - licenças e software",
+                "Despesas administrativas - locação de equipamentos",
+                "Despesas administrativas - certificado digital",
+                "Despesas administrativas - bpo financeiro",
+                "Despesas administrativas - contabilidade",
+                "Despesas administrativas - jurídico",
+                "Despesas administrativas - serviço de terceiros",
+                "Despesas administrativas - serviço de limpeza",
+                "Despesas administrativas - uso ou consumo",
+                "Despesas administrativas - seguro de veículo",
+                "Despesas administrativas - Farmácia",
+                "Despesas administrativas - ipva",
+                "Cartão de crédito empresarial",
+                "Despesas com instalação - medicina do trabalho",
+                "Despesas com Instalação - Dedetização",
+                "Despesas administrativas - viagens",
             ],
         },
     },
     "Investimentos": {  # vem após o Lucro Operacional
         "sinal": -1,
         "categorias": [
-            "Investimento - Participação em Eventos",
-            "Investimento em Sistema Próprio",
-            "Máquinas e equipamentos",
+            "Marketing e publicidade - tráfego pago",
             "Marketing e publicidade - facebook ads",
             "Marketing e publicidade - google ads",
+            "Marketing e publicidade - agência",
+            "Marketing e publicidade - plataforma e-mail mkt",
+            "Marketing e publicidade - trustvox avaliações recl",
+            "Marketing e publicidade - envio sms e whatsapp em",
+            "Projeto arquitetônico",
             "Móveis, utensílios e instalações",
+            "Máquinas e equipamentos",
             "Compra de ativo fixo",
+            "Investimento - pic",
+            "Investimento - titulo de capitalização",
+            "Investimento - iof sobre aplicações",
+            "Investimento - irrf sobre aplicações",
         ],
     },
     "Despesas Financeiras": {
         "sinal": -1,
         "categorias": [
-            "Taxas e contribuições",
-            "Tributos - IOF",
-            "Financeira - despesas financeiras",
-            "Financeira - estornos",
             "Financeira - juros fornecedores",
+            "Financeira - despesas financeiras",
             "Financeira - negociação de divida",
             "Financeira - tarifas bancárias",
+            "Financeira - anuidade cartão de crédito",
+            "Juros Pagos",
+            "Multas Pagas",
         ],
     },
-    "Atividade de Financiamento": {  # espelha o relatório nativo do Nibo
+    "Atividade de Financiamento": {  # saídas de financiamento
         "sinal": -1,
         "categorias": [
             "Retirada de capital",
-            "Distribuição de lucros",
             "Juros sobre empréstimo bnds",
-            "Pagamento empréstimo bnds",
+            "Pagamento despesas pessoais",
             "Pagamento de empréstimos a terceiros",
             "Pagamento de empréstimo de sócios",
             "Pagamento de empréstimos bancários",
             "Juros sobre empréstimos bancários",
-            "Multas sobre empréstimos bancários",
+            "Acertos Societários",
+            "Distribuição de lucros",
+        ],
+    },
+    "Captação de Recursos": {  # entradas de financiamento
+        "sinal": 1,
+        "categorias": [
+            "Aporte de capital",
+            "Obtenção de empréstimo de sócio",
+            "Obtenção de empréstimo de terceiros",
+            "Obtenção de empréstimo bancário",
         ],
     },
 }
@@ -161,6 +230,7 @@ DRE_LINES_ORDER = [
     ("Investimentos", "detalhe"),
     ("Despesas Financeiras", "detalhe"),
     ("Atividade de Financiamento", "detalhe"),
+    ("Captação de Recursos", "detalhe"),
     ("Não Classificado", "detalhe"),
     ("Geração de Caixa Realizada", "subtotal"),
 ]
@@ -413,7 +483,7 @@ def build_dre(pivot_categoria: pd.DataFrame) -> pd.DataFrame:
     dre.loc["Geração de Caixa Realizada"] = (
         dre.loc["Lucro Operacional"] + dre.loc["Investimentos"]
         + dre.loc["Despesas Financeiras"] + dre.loc["Atividade de Financiamento"]
-        + dre.loc["Não Classificado"]
+        + dre.loc["Captação de Recursos"] + dre.loc["Não Classificado"]
     )
 
     return dre
@@ -727,10 +797,21 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+nome_empresa = st.secrets.get("NOME_EMPRESA")
+if not nome_empresa:
+    st.error(
+        "⚠️ **NOME_EMPRESA não configurado nos Secrets deste app.** "
+        "Isso é de propósito — sem essa configuração, não dá pra saber com "
+        "segurança de qual cliente são os dados mostrados aqui. Adicione "
+        "`NOME_EMPRESA = \"Nome do Cliente\"` em Settings > Secrets antes de "
+        "usar este link."
+    )
+    nome_empresa = "⚠️ EMPRESA NÃO IDENTIFICADA"
+
 st.markdown(f"""
 <div class="breakr-header">
     <img src="data:image/png;base64,{BREAKR_LOGO_B64}" alt="Breakr">
-    <h1>DRE Gerencial — Breakr Assessoria</h1>
+    <h1>DRE Gerencial — {nome_empresa}</h1>
 </div>
 """, unsafe_allow_html=True)
 st.caption("Dados sincronizados automaticamente com o Nibo")
@@ -1030,7 +1111,7 @@ def gauge_kpi(titulo, valor_pct, valor_abs_fmt, faixa_max=60):
                 f"color:#1F2A44; margin-bottom:0;'>{titulo}</p>", unsafe_allow_html=True)
     st.plotly_chart(fig, use_container_width=True)
     st.markdown(f"<p style='text-align:center; font-size:0.85rem; color:#5A6472; "
-                f"margin-top:-10px;'>{md(valor_abs_fmt)}</p>", unsafe_allow_html=True)
+                f"margin-top:-10px;'>{valor_abs_fmt.replace('$', '&#36;')}</p>", unsafe_allow_html=True)
 
 
 kc1, kc2 = st.columns(2)
